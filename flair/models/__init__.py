@@ -4,6 +4,7 @@ from .entity_linker_model import EntityLinker
 from .language_model import LanguageModel
 from .lemmatizer_model import Lemmatizer
 from .pairwise_classification_model import TextPairClassifier
+from .order_embeddings_model import OrderEmbeddingsModel
 from .regexp_tagger import RegexpTagger
 from .relation_extractor_model import RelationExtractor
 from .sequence_tagger_model import MultiTagger, SequenceTagger
@@ -17,6 +18,7 @@ __all__ = [
     "LanguageModel",
     "Lemmatizer",
     "TextPairClassifier",
+    "OrderEmbeddingsModel",
     "RelationExtractor",
     "RegexpTagger",
     "MultiTagger",
