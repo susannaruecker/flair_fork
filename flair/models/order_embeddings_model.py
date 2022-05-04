@@ -54,6 +54,7 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         self.positive_samples_label_name = positive_samples_label_name
         self.negative_samples_label_name = negative_samples_label_name
         self.margin = margin
+        self.penalty_threshold = margin
 
         self.to(flair.device)
 
@@ -118,9 +119,13 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
     def order_violation_penalty(self, vector1, vector2):
         """
         computes order violation as proposed by Vendrov et al. 2016
-        ordered pair is (vector1, vector2)
+        ordered pair is (vector1, vector2), e.g. (dog, animal)
+        vector1 (hyponym) should be longer (higher value in each dimension) than vector2 (hypernym)
+        so: calculate difference vector vector2-vector1
+        set each element where vector1 is bigger than vector2 to 0 so that they don't get punished (because this is the "right" order)
         """
-        maxed_vector = torch.clamp((vector2-vector1), max=0) # todo: ist das die richtige Richtung so?
+
+        maxed_vector = torch.clamp((vector2-vector1), max=0)
         penalty_score = (maxed_vector.norm(p=2))**2
         # see:
         # https://stackoverflow.com/questions/68489765/what-is-the-correct-way-to-calculate-the-norm-1-norm-and-2-norm-of-vectors-in
@@ -135,12 +140,15 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         for vector1, vector2, label in zip(embedded_first, embedded_second, labels):
             penalty_score = self.order_violation_penalty(vector1, vector2)
             if label[0] == self.positive_samples_label_name: # todo: labels[0] not very pretty (labels is list of lists, but here just one each)
-                loss_sum += penalty_score
+                loss_sample = penalty_score
             elif label[0] == self.negative_samples_label_name:
-                loss_sum += max(0, self.margin - penalty_score)
+                loss_sample = torch.max(torch.zeros(1, device=flair.device),
+                                        self.margin - penalty_score)
+            #print(penalty_score, label, loss_sample)
+            loss_sum += loss_sample
         return loss_sum
 
-### TODO: make own predict method? because in the DefaultClassifier one the _calculaate_loss is used, but "wrongly"
+### TODO: make own predict method? because in the DefaultClassifier one the _calculate_loss is used, but "wrongly"
 
     def predict(
         self,
@@ -203,7 +211,6 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
                 )
                 # if anything could possibly be predicted
                 if len(data_points) > 0:
-                    #scores = self.decoder(embedded_data_points)
                     embedded_first = pair_embedding_tensor[:, :self.token_embeddings.embedding_length]
                     embedded_second = pair_embedding_tensor[:, self.token_embeddings.embedding_length:]
 
@@ -211,11 +218,7 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
                                        for vector1, vector2 in zip(embedded_first, embedded_second) ]
 
                     #print(penalty_scores)
-                    print("here am I!")
-                    ### TODO:
-                    # threshold definieren, ob dem hypernym ja nein?
-                    # das ist ja dann statt decoder...
-                    # _calculate_loss unten ändern
+                    #print("here am I!")
 
                     # remove previously predicted labels of this type
                     for data_point in data_points:
@@ -226,41 +229,52 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
                         label_count += len(data_points)
 
                     # TODO: das hier zu Verwendung mit Threshold ändern
-                    #softmax = torch.nn.functional.softmax(scores, dim=-1)
+                    # wie kann ich sinnvoll einen "score" definieren? Also sowas wie Abstand zum Threshold...?
+                    # ist halt seltsam, da penalty_score ja im Bereich [0, inf], threshold bei 1
 
-                    #if return_probabilities_for_all_classes:
-                    #    n_labels = softmax.size(1)
-                    #    for s_idx, data_point in enumerate(data_points):
-                    #        for l_idx in range(n_labels):
-                    #            label_value = self.label_dictionary.get_item_for_index(l_idx)
-                    #            if label_value == "O":
-                    #                continue
-                    #            label_score = softmax[s_idx, l_idx].item()
-                    #            data_point.add_label(typename=label_name, value=label_value, score=label_score)
-                    #else:
-                    #    conf, idx = torch.max(softmax, dim=-1)
-                    #    for data_point, c, i in zip(data_points, conf, idx):
-                    #        label_value = self.label_dictionary.get_item_for_index(i.item())
-                    #        if label_value == "O":
-                    #            continue
-                    #        data_point.add_label(typename=label_name, value=label_value, score=c.item())
+                    for data_point, penalty_score in zip(data_points, penalty_scores):
+                        if penalty_score > self.penalty_threshold:
+                            label_value = self.negative_samples_label_name
+                        else:
+                            label_value = self.positive_samples_label_name
+                        score = abs(penalty_score - self.penalty_threshold) # TODO: can be any... think about better solution
+                        data_point.add_label(typename=label_name, value=label_value, score=score)
 
                 store_embeddings(batch, storage_mode=embedding_storage_mode)
 
             if return_loss:
                 return overall_loss, label_count
 
+    def _print_predictions(self, batch, gold_label_type):
+        lines = []
+        for datapoint in batch:
+            # check if there is a label mismatch
+            g = [label.labeled_identifier for label in datapoint.get_labels(gold_label_type)]
+            p = [label.labeled_identifier for label in datapoint.get_labels("predicted")]
+            g.sort()
+            p.sort()
+            correct_string = " -> MISMATCH!\n" if g != p else ""
+            # print info
+            eval_line = (
+                #f"{datapoint.to_original_text()}\n"
+                f"{datapoint.text}\n"
+                f" - Gold: {', '.join(label.value if label.data_point == datapoint else label.labeled_identifier for label in datapoint.get_labels(gold_label_type))}\n"
+                f" - Pred: {', '.join(label.value if label.data_point == datapoint else label.labeled_identifier for label in datapoint.get_labels('predicted'))}\n{correct_string}\n"
+            )
+            lines.append(eval_line)
+        return lines
+
 
     def _get_state_dict(self):
         model_state = {
             **super()._get_state_dict(),
-            "document_embeddings": self.document_embeddings,
+            "token_embeddings": self.token_embeddings,
             "label_dictionary": self.label_dictionary,
             "label_type": self.label_type,
-            "multi_label": self.multi_label,
-            "multi_label_threshold": self.multi_label_threshold,
             "weight_dict": self.weight_dict,
-            "embed_separately": self.embed_separately,
+            "positive_samples_label_name": self.positive_samples_label_name,
+            "negative_samples_label_name": self.negative_samples_label_name,
+            "margin": self.margin,
         }
         return model_state
 
@@ -268,14 +282,12 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
     def _init_model_with_state_dict(cls, state, **kwargs):
         return super()._init_model_with_state_dict(
             state,
-            document_embeddings=state["document_embeddings"],
+            token_embeddings=state["token_embeddings"],
             label_dictionary=state["label_dictionary"],
             label_type=state["label_type"],
-            multi_label=state["multi_label"],
-            multi_label_threshold=0.5
-            if "multi_label_threshold" not in state.keys()
-            else state["multi_label_threshold"],
             loss_weights=state["weight_dict"],
-            embed_separately=state["embed_separately"],
+            positive_samples_label_name=state["positive_samples_label_name"],
+            negative_samples_label_name=state["negative_samples_label_name"],
+            margin=state["margin"],
             **kwargs,
         )
