@@ -54,9 +54,11 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         self.positive_samples_label_name = positive_samples_label_name
         self.negative_samples_label_name = negative_samples_label_name
         self.margin = margin
-        self.penalty_threshold = margin
+        self.penalty_threshold = self.margin
 
         self.to(flair.device)
+
+        del self.decoder  # decoder from parent class (DefaultClassifier) not in use, so delete it
 
     @property
     def label_type(self):
@@ -93,6 +95,8 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
 
         pair_embedding_tensor = torch.cat(pair_embedding_list, 0).to(flair.device)
 
+        #self.relu(pair_embedding_tensor)  # only allow positive values
+
         labels = []
         for pair in datapairs:
             labels.append([label.value for label in pair.get_labels(self.label_type)])
@@ -114,7 +118,12 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
             return torch.tensor(0.0, requires_grad=True, device=flair.device), 1
 
         # calculate the loss (the order violation penalty from Vendrov et al. 2016)
-        return self._calculate_loss(embedded_first, embedded_second, labels)
+
+        loss = self._calculate_loss(embedded_first, embedded_second, labels)
+
+        #for s,vec1,vec2,loss in zip(sentences, embedded_first, embedded_second, loss):
+        #    print(s.text, s.tag, vec1[:5], vec2[:5], loss)
+        return loss
 
     def order_violation_penalty(self, vector1, vector2):
         """
@@ -124,11 +133,13 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         so: calculate difference vector vector2-vector1
         set each element where vector1 is bigger than vector2 to 0 so that they don't get punished (because this is the "right" order)
         """
-
-        maxed_vector = torch.clamp((vector2-vector1), max=0)
-        penalty_score = (maxed_vector.norm(p=2))**2
+        diff_vector = vector2-vector1
+        maxed_vector = torch.clamp(diff_vector, min=0)
+        # confusing max/min notations!: in the paper, they use max(0, diff), meaning (I think) "Take 0 in case diff is negative"
+        # here we use min(), meaning "clamp in a range with min==0" which should be the same think
+        penalty_score = (torch.linalg.norm(maxed_vector, ord=2))**2 #todo: is this the right norm? ord=1 or ord=2? ||.||
         # see:
-        # https://stackoverflow.com/questions/68489765/what-is-the-correct-way-to-calculate-the-norm-1-norm-and-2-norm-of-vectors-in
+        # https://stackoverflow.com/questions/68489765/what-is-the-correct-way-to-calculate-the-norm-1-norm-and-2-norm-of-vectors-in-pytorch
 
         return penalty_score
 
@@ -218,7 +229,6 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
                                        for vector1, vector2 in zip(embedded_first, embedded_second) ]
 
                     #print(penalty_scores)
-                    #print("here am I!")
 
                     # remove previously predicted labels of this type
                     for data_point in data_points:
@@ -237,7 +247,8 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
                             label_value = self.negative_samples_label_name
                         else:
                             label_value = self.positive_samples_label_name
-                        score = abs(penalty_score - self.penalty_threshold) # TODO: can be any... think about better solution
+                        score = penalty_score # TODO: can be [0, inf], so not really "score"... think about better solution
+                        #print(data_point, label_value, score)
                         data_point.add_label(typename=label_name, value=label_value, score=score)
 
                 store_embeddings(batch, storage_mode=embedding_storage_mode)
@@ -253,17 +264,16 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
             p = [label.labeled_identifier for label in datapoint.get_labels("predicted")]
             g.sort()
             p.sort()
-            correct_string = " -> MISMATCH!\n" if g != p else ""
+            correct_string = " -> ❌\n" if g != p else " -> ✓\n"
             # print info
             eval_line = (
                 #f"{datapoint.to_original_text()}\n"
                 f"{datapoint.text}\n"
                 f" - Gold: {', '.join(label.value if label.data_point == datapoint else label.labeled_identifier for label in datapoint.get_labels(gold_label_type))}\n"
-                f" - Pred: {', '.join(label.value if label.data_point == datapoint else label.labeled_identifier for label in datapoint.get_labels('predicted'))}\n{correct_string}\n"
+                f" - Pred: {', '.join(label.value if label.data_point == datapoint else label.labeled_identifier for label in datapoint.get_labels('predicted'))}\t{correct_string}\n"
             )
             lines.append(eval_line)
         return lines
-
 
     def _get_state_dict(self):
         model_state = {
