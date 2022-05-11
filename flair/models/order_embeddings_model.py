@@ -9,6 +9,7 @@ from flair.datasets import DataLoader, FlairDatapointDataset
 from flair.training_utils import store_embeddings
 
 from tqdm import tqdm
+import numpy.random as random
 
 
 #import flair.nn.model
@@ -26,9 +27,10 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         self,
         token_embeddings: flair.embeddings.TokenEmbeddings,
         label_type: str,
-        positive_samples_label_name: str = "hyper",
+        positive_samples_label_name: str,
         negative_samples_label_name: str = "random",
         margin : float = 1.0,
+        create_negative_samples : bool = True,
         **classifierargs,
     ):
         """
@@ -55,6 +57,7 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         self.negative_samples_label_name = negative_samples_label_name
         self.margin = margin
         self.penalty_threshold = self.margin
+        self.create_negative_samples = create_negative_samples
 
         self.to(flair.device)
 
@@ -78,6 +81,39 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         # embed both sentences separately
         first_elements = [pair.first for pair in datapairs]
         second_elements = [pair.second for pair in datapairs]
+
+        if self.create_negative_samples:
+            corrupted_first = []
+            corrupted_second = []
+            replace_which = random.choice(["first", "second"], size=len(datapairs)) # to decide which to replace
+            #print(replace_which)
+
+            for i, which in enumerate(replace_which):
+                # get a random word from dict (to replace one of the true concepts with it)
+                random_from_dict = random.choice(self.token_embeddings.vocab_dictionary.idx2item).decode("utf-8")
+                # TODO: like so, could happen that some REAL pairs get created but labeled as negative... can I prevent that?
+
+                if which == "first":
+                    corrupted_first.append(Sentence(random_from_dict)) # replace first with random
+                    corrupted_second.append(second_elements[i])
+
+                if which == "second":
+                    corrupted_first.append(first_elements[i])
+                    corrupted_second.append(Sentence(random_from_dict)) # replace second with random
+
+            # make datapairs out of them (with the negative label name)
+            #TODO: I could look if the random pair IS in the dataset, then use the positive label (to prevent inserting noise)
+
+            corrupted_pairs = [flair.data.DataPair(corrupted_first[i], corrupted_second[i])
+                                    .add_label(self.label_type, value=self.negative_samples_label_name)
+                                for i in range(len(datapairs))]
+
+            # and extend the original datapairs with them
+            datapairs.extend(corrupted_pairs)
+
+            # append the created negative examples:
+            first_elements.extend(corrupted_first)
+            second_elements.extend(corrupted_second)
 
         self.token_embeddings.embed(first_elements)
         self.token_embeddings.embed(second_elements)
@@ -155,6 +191,8 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
             elif label[0] == self.negative_samples_label_name:
                 loss_sample = torch.max(torch.zeros(1, device=flair.device),
                                         self.margin - penalty_score)
+            else:
+                loss_sample = 0
             #print(penalty_score, label, loss_sample)
             loss_sum += loss_sample
         return loss_sum
@@ -285,6 +323,7 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
             "positive_samples_label_name": self.positive_samples_label_name,
             "negative_samples_label_name": self.negative_samples_label_name,
             "margin": self.margin,
+            "create_negative_samples": self.create_negative_samples,
         }
         return model_state
 
@@ -299,5 +338,6 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
             positive_samples_label_name=state["positive_samples_label_name"],
             negative_samples_label_name=state["negative_samples_label_name"],
             margin=state["margin"],
+            create_negative_samples=state["create_negative_samples"],
             **kwargs,
         )
