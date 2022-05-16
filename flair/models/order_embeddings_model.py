@@ -11,40 +11,33 @@ from flair.training_utils import store_embeddings
 from tqdm import tqdm
 import numpy.random as random
 
-
-#import flair.nn.model
-
 from typing import List, Tuple, Union, Optional
 
 
-
 class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
-    """
-    #todo
-    """
-
     def __init__(
         self,
         token_embeddings: flair.embeddings.TokenEmbeddings,
         label_type: str,
         positive_samples_label_name: str,
-        negative_samples_label_name: str = "random",
+        negative_samples_label_name: str = "negative",
+        use_existing_negative_samples_label_names: List[str] =None,
         margin : float = 1.0,
         create_negative_samples : bool = True,
         **classifierargs,
     ):
         """
-        Initializes a TextClassifier
-        :param token_embeddings: embeddings used to embed each data point # TODO: Achtung, gerade mache ich Token-Level, wäre DocEmbs besser?
-        :param label_dictionary: dictionary of labels you want to predict
-        :param positive_samples_label_name
-        :param negative_samples_label_name
+        Initializes a OrderEmbeddingsModel.
+        :param token_embeddings: embeddings used to embed each data point
+        :param positive_samples_label_name: how the positive samples are labeled, eg. "hypernymy"
+        :param negative_samples_label_name: how the negative samples will be labeld, eg. "negatove" or "random"
+        :param use_existing_negative_samples_label_names: if they are labels in Dataset that are to be used as negative examples (eg. another relation type, maybe "meronymy")
+        :param create_negative_samples: whether negative samples should be created per positive example in batch (via random corruption)
         :param margin
 
         """
         super().__init__(
             **classifierargs,
-            #final_embedding_size=token_embeddings.embedding_length,
             final_embedding_size=2 * token_embeddings.embedding_length
 
         )
@@ -55,6 +48,7 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
 
         self.positive_samples_label_name = positive_samples_label_name
         self.negative_samples_label_name = negative_samples_label_name
+        self.use_existing_negative_samples_label_names = use_existing_negative_samples_label_names
         self.margin = margin
         self.penalty_threshold = self.margin
         self.create_negative_samples = create_negative_samples
@@ -76,37 +70,62 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         if not isinstance(datapairs, list):
             datapairs = [datapairs]
 
+        if self.use_existing_negative_samples_label_names == None:
+
+            # filter out negatives (if they are in the corpus)
+            ids_positive_in_batch = []
+            ids_to_delete = []
+            for i, d in enumerate(datapairs):
+                if d.get_labels(self.label_type)[0].value == self.positive_samples_label_name:
+                    ids_positive_in_batch.append(i)
+
+                # TODO: debug this! ids change during deletion!
+                #else:
+                #    ids_to_delete.append(i)
+                #    datapairs.remove(datapairs[i])
+
+        else:
+            ids_positive_in_batch = []
+            # set all negative samples to having the same label name
+            for i, d in enumerate(datapairs):
+                if d.get_labels(self.label_type)[0].value in self.use_existing_negative_samples_label_names:
+                    d.set_label(self.label_type, value = self.negative_samples_label_name, score = 1.0)
+                else:
+                    ids_positive_in_batch.append(i)
+
         embedding_names = self.token_embeddings.get_names()
 
         # embed both sentences separately
         first_elements = [pair.first for pair in datapairs]
         second_elements = [pair.second for pair in datapairs]
 
+        # make random negative samples from the positive ones (not really necessary if there are existing negatives that are used (above))
         if self.create_negative_samples:
             corrupted_first = []
             corrupted_second = []
-            replace_which = random.choice(["first", "second"], size=len(datapairs)) # to decide which to replace
+            replace_which = random.choice(["first", "second"], size=len(ids_positive_in_batch)) # to decide which to replace
+            replace_which = zip(ids_positive_in_batch, replace_which)
             #print(replace_which)
 
-            for i, which in enumerate(replace_which):
+            for (i, which) in replace_which:
                 # get a random word from dict (to replace one of the true concepts with it)
                 random_from_dict = random.choice(self.token_embeddings.vocab_dictionary.idx2item).decode("utf-8")
                 # TODO: like so, could happen that some REAL pairs get created but labeled as negative... can I prevent that?
+                # also: could be a pair like ("frog","frog", "random") which is bad
+                # could look if the random pair IS in the dataset, then use the positive label (to prevent inserting noise)
 
                 if which == "first":
-                    corrupted_first.append(Sentence(random_from_dict)) # replace first with random
+                    corrupted_first.append(Sentence(random_from_dict, use_tokenizer=False)) # replace first with random
                     corrupted_second.append(second_elements[i])
 
                 if which == "second":
                     corrupted_first.append(first_elements[i])
-                    corrupted_second.append(Sentence(random_from_dict)) # replace second with random
+                    corrupted_second.append(Sentence(random_from_dict, use_tokenizer=False)) # replace second with random
 
             # make datapairs out of them (with the negative label name)
-            #TODO: I could look if the random pair IS in the dataset, then use the positive label (to prevent inserting noise)
-
             corrupted_pairs = [flair.data.DataPair(corrupted_first[i], corrupted_second[i])
                                     .add_label(self.label_type, value=self.negative_samples_label_name)
-                                for i in range(len(datapairs))]
+                                for i in range(len(corrupted_first))]
 
             # and extend the original datapairs with them
             datapairs.extend(corrupted_pairs)
@@ -130,8 +149,6 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
         ]
 
         pair_embedding_tensor = torch.cat(pair_embedding_list, 0).to(flair.device)
-
-        #self.relu(pair_embedding_tensor)  # only allow positive values
 
         labels = []
         for pair in datapairs:
@@ -195,9 +212,7 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
                 loss_sample = 0
             #print(penalty_score, label, loss_sample)
             loss_sum += loss_sample
-        return loss_sum
-
-### TODO: make own predict method? because in the DefaultClassifier one the _calculate_loss is used, but "wrongly"
+        return loss_sum, len(labels)
 
     def predict(
         self,
@@ -273,12 +288,11 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
                         data_point.remove_labels(label_name)
 
                     if return_loss:
-                        overall_loss += self._calculate_loss(embedded_first, embedded_second, gold_labels)
+                        overall_loss += self._calculate_loss(embedded_first, embedded_second, gold_labels)[0]
                         label_count += len(data_points)
 
-                    # TODO: das hier zu Verwendung mit Threshold ändern
-                    # wie kann ich sinnvoll einen "score" definieren? Also sowas wie Abstand zum Threshold...?
-                    # ist halt seltsam, da penalty_score ja im Bereich [0, inf], threshold bei 1
+                    #TODO: how to get a sensible "score"? sth. like distance to threshold...?
+                    # penalty_score is between [0, inf], threshold at 1.0
 
                     for data_point, penalty_score in zip(data_points, penalty_scores):
                         if penalty_score > self.penalty_threshold:
@@ -286,8 +300,8 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
                         else:
                             label_value = self.positive_samples_label_name
                         score = penalty_score # TODO: can be [0, inf], so not really "score"... think about better solution
-                        #print(data_point, label_value, score)
                         data_point.add_label(typename=label_name, value=label_value, score=score)
+                        #print(data_point, label_value, score)
 
                 store_embeddings(batch, storage_mode=embedding_storage_mode)
 
@@ -305,7 +319,6 @@ class OrderEmbeddingsModel(flair.nn.DefaultClassifier[TextPair]):
             correct_string = " -> ❌\n" if g != p else " -> ✓\n"
             # print info
             eval_line = (
-                #f"{datapoint.to_original_text()}\n"
                 f"{datapoint.text}\n"
                 f" - Gold: {', '.join(label.value if label.data_point == datapoint else label.labeled_identifier for label in datapoint.get_labels(gold_label_type))}\n"
                 f" - Pred: {', '.join(label.value if label.data_point == datapoint else label.labeled_identifier for label in datapoint.get_labels('predicted'))}\t{correct_string}\n"
